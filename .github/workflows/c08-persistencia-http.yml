@@ -1,0 +1,133 @@
+name: C08 Persistencia HTTP nativa
+
+on:
+  push:
+    branches:
+      - c08-persistencia-http
+    paths:
+      - input/PROT-002_InterfazMinima_IALP_v0.3-DRAFT.zip
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  persistencia-http:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verificar entrada inmutable
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f input/PROT-002_InterfazMinima_IALP_v0.3-DRAFT.zip
+          sha256sum --check C08_EXPECTED_SHA256.txt
+
+      - name: Preparar PROT-002 v0.3
+        id: extract
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ialp-source" "$RUNNER_TEMP/ialp-c08-evidence"
+          unzip -q input/PROT-002_InterfazMinima_IALP_v0.3-DRAFT.zip -d "$RUNNER_TEMP/ialp-source"
+          ROOT="$(find "$RUNNER_TEMP/ialp-source" -type f -name index.html -printf '%h\n' | head -n 1)"
+          test -n "$ROOT"
+          echo "root=$ROOT" >> "$GITHUB_OUTPUT"
+          find "$ROOT" -type f -print0 | sort -z | xargs -0 sha256sum > "$RUNNER_TEMP/tree-before.sha256"
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Instalar navegador real
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install playwright
+          python -m playwright install --with-deps chromium
+
+      - name: Ejecutar pruebas base no destructivas
+        working-directory: ${{ steps.extract.outputs.root }}
+        env:
+          IALP_TEST_OUTPUT: ${{ runner.temp }}/ialp-c08-evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tests/smoke_test.py | tee "$IALP_TEST_OUTPUT/smoke.log"
+          python tests/browser_test.py | tee "$IALP_TEST_OUTPUT/browser-adversarial.log"
+          python tests/verify_manifest.py | tee "$IALP_TEST_OUTPUT/manifest.log"
+
+      - name: Ejecutar C08 con HTTP y localStorage nativo
+        working-directory: ${{ steps.extract.outputs.root }}
+        env:
+          IALP_TEST_OUTPUT: ${{ runner.temp }}/ialp-c08-evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tests/http_persistence_test.py 2>&1 | tee "$IALP_TEST_OUTPUT/http-persistence.log"
+
+      - name: Verificar que las pruebas no modificaron PROT-002
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="${{ steps.extract.outputs.root }}"
+          find "$ROOT" -type f -print0 | sort -z | xargs -0 sha256sum > "$RUNNER_TEMP/tree-after.sha256"
+          diff -u "$RUNNER_TEMP/tree-before.sha256" "$RUNNER_TEMP/tree-after.sha256" | tee "$RUNNER_TEMP/ialp-c08-evidence/non-destructive.diff"
+
+      - name: Validar resultado material de C08
+        shell: bash
+        run: |
+          set -euo pipefail
+          EVIDENCE="$RUNNER_TEMP/ialp-c08-evidence"
+          RESULT="$(find "$EVIDENCE" "${{ steps.extract.outputs.root }}" -type f -name 'http_persistence_result.json' | head -n 1)"
+          test -n "$RESULT"
+          cp "$RESULT" "$EVIDENCE/http_persistence_result.json"
+          python - "$EVIDENCE/http_persistence_result.json" <<'PY'
+          import json, pathlib, sys
+          path = pathlib.Path(sys.argv[1])
+          data = json.loads(path.read_text(encoding='utf-8'))
+          rendered = json.dumps(data, ensure_ascii=False, indent=2)
+          print(rendered)
+          forbidden = ('BLOCKED', 'NOT_EXECUTED', 'FAIL', 'ERROR')
+          if any(token in rendered.upper() for token in forbidden):
+              raise SystemExit('C08 no queda cerrado: el resultado contiene un estado no ejecutado o fallido.')
+          required_pass = ['http_server', 'browser_navigation', 'native_localStorage_reload']
+          missing = [key for key in required_pass if str(data.get(key, '')).upper() != 'PASS']
+          if missing:
+              raise SystemExit(f'C08 no queda cerrado: faltan PASS obligatorios en {missing}')
+          PY
+
+      - name: Crear resumen C08
+        if: always()
+        shell: bash
+        run: |
+          EVIDENCE="$RUNNER_TEMP/ialp-c08-evidence"
+          {
+            echo '# IALP-EJEC-PersistenciaHTTP-v0.3-C08'
+            echo
+            echo '- Repositorio: MarcValls/IALAP'
+            echo '- Rama: c08-persistencia-http'
+            echo '- Commit: ${{ github.sha }}'
+            echo '- PROT-003: no iniciado'
+            echo
+            if [ -f "$EVIDENCE/http_persistence_result.json" ]; then
+              echo '```json'
+              cat "$EVIDENCE/http_persistence_result.json"
+              echo '```'
+            fi
+          } | tee "$EVIDENCE/C08_SUMMARY.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publicar evidencia C08
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: IALP-C08-persistencia-http-${{ github.run_id }}
+          path: ${{ runner.temp }}/ialp-c08-evidence
+          if-no-files-found: error
+          retention-days: 30
